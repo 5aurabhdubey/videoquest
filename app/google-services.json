@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "326439984354",
+    "project_id": "videoquest-3bf47",
+    "storage_bucket": "videoquest-3bf47.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:326439984354:android:fe650eb79efdc0441c12bb",
+        "android_client_info": {
+          "package_name": "com.indianlegend.videoquest"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDYADEtUb617n1idkvHqLGOdFcY3EQ3M8U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
