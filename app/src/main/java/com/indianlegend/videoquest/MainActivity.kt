@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.VideoCall
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.Logout
+import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -47,7 +48,6 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -69,6 +69,9 @@ import com.google.firebase.analytics.ktx.logEvent
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.ktx.auth
 import com.google.firebase.ktx.Firebase
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -76,7 +79,9 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import androidx.activity.viewModels
 import androidx.lifecycle.ViewModelProvider
+
 import androidx.lifecycle.lifecycleScope
 
 // Data Models
@@ -100,7 +105,8 @@ data class VideoMetadata(
     val taskId: String = "",
     val timestamp: Long = 0,
     val isApproved: Boolean = false,
-    val userId: String = "" // Track which user recorded the video
+    val userId: String = "",
+    val completionNote: String = ""
 )
 
 // Room Database
@@ -119,7 +125,8 @@ data class VideoMetadataEntity(
     val taskId: String,
     val timestamp: Long,
     val isApproved: Boolean,
-    val userId: String
+    val userId: String,
+    val completionNote: String
 )
 
 @Dao
@@ -149,7 +156,7 @@ interface VideoMetadataDao {
     suspend fun updateApprovalStatus(path: String, isApproved: Boolean)
 }
 
-@Database(entities = [TaskEntity::class, VideoMetadataEntity::class], version = 2, exportSchema = false)
+@Database(entities = [TaskEntity::class, VideoMetadataEntity::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun taskDao(): TaskDao
     abstract fun videoMetadataDao(): VideoMetadataDao
@@ -165,8 +172,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "videoquest_database"
                 )
-                    .allowMainThreadQueries()
-                    .fallbackToDestructiveMigration() // Handle schema changes for this update
+                    .fallbackToDestructiveMigration()
                     .build()
                 INSTANCE = instance
                 instance
@@ -174,48 +180,67 @@ abstract class AppDatabase : RoomDatabase() {
         }
     }
 }
+// TaskViewModel Factory
+class TaskViewModelFactory(private val database: AppDatabase) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(TaskViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return TaskViewModel(database) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
 
-// ViewModel
 class TaskViewModel(private val database: AppDatabase) : ViewModel() {
-    val tasks = mutableStateListOf<Task>()
-    val recordedVideos = mutableStateListOf<VideoMetadata>()
     private val taskDao = database.taskDao()
     private val videoDao = database.videoMetadataDao()
 
+    private val _tasks = MutableStateFlow<List<Task>>(emptyList())
+    val tasks: StateFlow<List<Task>> = _tasks.asStateFlow()
+
+    private val _recordedVideos = MutableStateFlow<List<VideoMetadata>>(emptyList())
+    val recordedVideos: StateFlow<List<VideoMetadata>> = _recordedVideos.asStateFlow()
+
     init {
+        refreshData()
+    }
+
+    fun refreshData() {
         viewModelScope.launch {
-            tasks.clear()
-            tasks.addAll(taskDao.getAllTasks().map { Task(it.id, it.title, it.description, it.points, it.durationSeconds) })
-            recordedVideos.clear()
-            recordedVideos.addAll(videoDao.getAllVideos().map { VideoMetadata(it.path, it.taskId, it.timestamp, it.isApproved, it.userId) })
+            _tasks.value = taskDao.getAllTasks().map { Task(it.id, it.title, it.description, it.points, it.durationSeconds) }
+            _recordedVideos.value = videoDao.getAllVideos().map { VideoMetadata(it.path, it.taskId, it.timestamp, it.isApproved, it.userId, it.completionNote) }
         }
+    }
+
+    fun clearData() {
+        _tasks.value = emptyList()
+        _recordedVideos.value = emptyList()
     }
 
     suspend fun addTask(task: Task) {
         taskDao.insertTask(TaskEntity(task.id, task.title, task.description, task.points, task.durationSeconds))
-        tasks.add(task)
+        _tasks.value = _tasks.value + task
     }
 
     suspend fun deleteTask(task: Task) {
         taskDao.deleteTask(TaskEntity(task.id, task.title, task.description, task.points, task.durationSeconds))
-        tasks.remove(task)
+        _tasks.value = _tasks.value - task
     }
 
     suspend fun addVideo(video: VideoMetadata) {
-        videoDao.insertVideo(VideoMetadataEntity(video.path, video.taskId, video.timestamp, video.isApproved, video.userId))
-        recordedVideos.add(video)
+        videoDao.insertVideo(VideoMetadataEntity(video.path, video.taskId, video.timestamp, video.isApproved, video.userId, video.completionNote))
+        _recordedVideos.value = _recordedVideos.value + video
     }
 
     suspend fun approveVideo(videoPath: String, isApproved: Boolean) {
         videoDao.updateApprovalStatus(videoPath, isApproved)
-        val video = recordedVideos.find { it.path == videoPath }
-        video?.let {
-            recordedVideos[recordedVideos.indexOf(it)] = it.copy(isApproved = isApproved)
+        _recordedVideos.value = _recordedVideos.value.map {
+            if (it.path == videoPath) it.copy(isApproved = isApproved) else it
         }
     }
 
     fun getTaskPoints(taskId: String): Int {
-        return tasks.find { it.id == taskId }?.points ?: 0
+        return tasks.value.find { it.id == taskId }?.points ?: 0
     }
 }
 
@@ -225,6 +250,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var auth: FirebaseAuth
     private lateinit var analytics: FirebaseAnalytics
 
+    private val taskViewModel: TaskViewModel by viewModels {
+        TaskViewModelFactory(database)
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         database = AppDatabase.getDatabase(this)
@@ -240,7 +268,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             VideoQuestTheme {
-                VideoQuestApp(database, auth, analytics)
+                VideoQuestApp(database, auth, analytics, taskViewModel)
             }
         }
     }
@@ -251,9 +279,9 @@ class MainActivity : ComponentActivity() {
 fun VideoQuestTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = lightColorScheme(
-            primary = Color(0xFF3F51B5), // Indigo
-            secondary = Color(0xFFFF4081), // Pink
-            background = Color(0xFFECEFF1), // Light Gray
+            primary = Color(0xFF3F51B5),
+            secondary = Color(0xFFFF4081),
+            background = Color(0xFFECEFF1),
             surface = Color.White,
             onPrimary = Color.White,
             onSecondary = Color.White,
@@ -267,15 +295,9 @@ fun VideoQuestTheme(content: @Composable () -> Unit) {
 
 // Navigation
 @Composable
-fun VideoQuestApp(database: AppDatabase, auth: FirebaseAuth, analytics: FirebaseAnalytics) {
+fun VideoQuestApp(database: AppDatabase, auth: FirebaseAuth, analytics: FirebaseAnalytics, viewModel: TaskViewModel) {
     val navController = rememberNavController()
     var currentUser by remember { mutableStateOf<User?>(null) }
-    val viewModel: TaskViewModel = viewModel(factory = object : ViewModelProvider.Factory {
-        @Suppress("UNCHECKED_CAST")
-        override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            return TaskViewModel(database) as T
-        }
-    })
 
     LaunchedEffect(auth.currentUser) {
         auth.currentUser?.let {
@@ -285,6 +307,10 @@ fun VideoQuestApp(database: AppDatabase, auth: FirebaseAuth, analytics: Firebase
                 role = if (it.email == "admin@example.com") "admin" else "user",
                 points = 50
             )
+            viewModel.refreshData()
+        } ?: run {
+            currentUser = null
+            viewModel.clearData()
         }
     }
 
@@ -313,6 +339,25 @@ fun VideoQuestApp(database: AppDatabase, auth: FirebaseAuth, analytics: Firebase
                             popUpTo("login") { inclusive = true }
                         }
                     }
+                },
+                onNavigateToRegister = {
+                    navController.navigate("register")
+                }
+            )
+        }
+        composable("register") {
+            RegisterScreen(
+                auth = auth,
+                analytics = analytics,
+                onRegisterSuccess = {
+                    navController.navigate("login") {
+                        popUpTo("register") { inclusive = true }
+                    }
+                },
+                onBack = {
+                    navController.navigate("login") {
+                        popUpTo("register") { inclusive = true }
+                    }
                 }
             )
         }
@@ -333,6 +378,7 @@ fun VideoQuestApp(database: AppDatabase, auth: FirebaseAuth, analytics: Firebase
                 onLogout = {
                     auth.signOut()
                     currentUser = null
+                    viewModel.clearData()
                     analytics.logEvent("logout") {
                         param("user_type", "user")
                     }
@@ -356,6 +402,7 @@ fun VideoQuestApp(database: AppDatabase, auth: FirebaseAuth, analytics: Firebase
                 onLogout = {
                     auth.signOut()
                     currentUser = null
+                    viewModel.clearData()
                     analytics.logEvent("logout") {
                         param("user_type", "admin")
                     }
@@ -400,6 +447,27 @@ fun VideoQuestApp(database: AppDatabase, auth: FirebaseAuth, analytics: Firebase
                     navController.navigate("task") {
                         popUpTo("video_record/$taskId") { inclusive = true }
                     }
+                },
+                onNavigateToCompletionNote = { videoPath ->
+                    val encodedVideoPath = Uri.encode(videoPath)
+                    navController.navigate("completion_note/$taskId/$encodedVideoPath")
+                }
+            )
+        }
+        composable("completion_note/{taskId}/{videoPath}") { backStackEntry ->
+            val taskId = backStackEntry.arguments?.getString("taskId") ?: ""
+            val encodedVideoPath = backStackEntry.arguments?.getString("videoPath") ?: ""
+            val videoPath = Uri.decode(encodedVideoPath)
+            CompletionNoteScreen(
+                taskId = taskId,
+                videoPath = videoPath,
+                viewModel = viewModel,
+                analytics = analytics,
+                userId = currentUser?.id ?: "",
+                onBack = {
+                    navController.navigate("task") {
+                        popUpTo("completion_note/$taskId/$encodedVideoPath") { inclusive = true }
+                    }
                 }
             )
         }
@@ -431,6 +499,7 @@ fun LoginScreen(
     auth: FirebaseAuth,
     analytics: FirebaseAnalytics,
     onLoginSuccess: (String) -> Unit,
+    onNavigateToRegister: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -565,6 +634,224 @@ fun LoginScreen(
                             Text("Login", fontSize = 16.sp, fontWeight = FontWeight.Bold)
                         }
                     }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Button(
+                        onClick = onNavigateToRegister,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .semantics { contentDescription = "Register button" },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFFFF4081),
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Icon(Icons.Outlined.PersonAdd, contentDescription = null, modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Register", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun RegisterScreen(
+    auth: FirebaseAuth,
+    analytics: FirebaseAnalytics,
+    onRegisterSuccess: () -> Unit,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var confirmPassword by remember { mutableStateOf("") }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isLoading by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Register", color = Color.White) },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color(0xFF3F51B5)
+                ),
+                navigationIcon = {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.semantics { contentDescription = "Back button" }
+                    ) {
+                        Icon(
+                            Icons.Default.ArrowBack,
+                            contentDescription = "Navigate back",
+                            tint = Color.White
+                        )
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(MaterialTheme.colorScheme.background)
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                shape = RoundedCornerShape(16.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    OutlinedTextField(
+                        value = email,
+                        onValueChange = { email = it },
+                        label = { Text("Email") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .semantics { contentDescription = "Email input field" },
+                        enabled = !isLoading,
+                        colors = TextFieldDefaults.colors(
+                            focusedIndicatorColor = Color(0xFF3F51B5),
+                            focusedLabelColor = Color(0xFF3F51B5),
+                            unfocusedContainerColor = Color.Transparent
+                        )
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        label = { Text("Password") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .semantics { contentDescription = "Password input field" },
+                        visualTransformation = PasswordVisualTransformation(),
+                        enabled = !isLoading,
+                        colors = TextFieldDefaults.colors(
+                            focusedIndicatorColor = Color(0xFF3F51B5),
+                            focusedLabelColor = Color(0xFF3F51B5),
+                            unfocusedContainerColor = Color.Transparent
+                        )
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = confirmPassword,
+                        onValueChange = { confirmPassword = it },
+                        label = { Text("Confirm Password") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .semantics { contentDescription = "Confirm password input field" },
+                        visualTransformation = PasswordVisualTransformation(),
+                        enabled = !isLoading,
+                        colors = TextFieldDefaults.colors(
+                            focusedIndicatorColor = Color(0xFF3F51B5),
+                            focusedLabelColor = Color(0xFF3F51B5),
+                            unfocusedContainerColor = Color.Transparent
+                        )
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    if (errorMessage != null) {
+                        Text(
+                            errorMessage!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.semantics { contentDescription = "Error message: $errorMessage" }
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    Button(
+                        onClick = {
+                            if (email.isBlank() || password.isBlank() || confirmPassword.isBlank()) {
+                                errorMessage = "All fields are required"
+                                return@Button
+                            }
+                            if (password != confirmPassword) {
+                                errorMessage = "Passwords do not match"
+                                return@Button
+                            }
+                            if (password.length < 6) {
+                                errorMessage = "Password must be at least 6 characters"
+                                return@Button
+                            }
+                            isLoading = true
+                            errorMessage = null
+                            auth.createUserWithEmailAndPassword(email, password)
+                                .addOnSuccessListener {
+                                    isLoading = false
+                                    analytics.logEvent(FirebaseAnalytics.Event.SIGN_UP) {
+                                        param(FirebaseAnalytics.Param.METHOD, "email")
+                                    }
+                                    Toast.makeText(context, "Registration successful", Toast.LENGTH_SHORT).show()
+                                    onRegisterSuccess()
+                                }
+                                .addOnFailureListener { e ->
+                                    isLoading = false
+                                    errorMessage = e.message ?: "Registration failed"
+                                    analytics.logEvent("register_error") {
+                                        param("error_message", errorMessage!!)
+                                        param("email", email)
+                                    }
+                                }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .semantics { contentDescription = "Register button" },
+                        shape = RoundedCornerShape(12.dp),
+                        enabled = !isLoading,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF3F51B5),
+                            contentColor = Color.White
+                        )
+                    ) {
+                        if (isLoading) {
+                            CircularProgressIndicator(color = Color.White)
+                        } else {
+                            Text("Create Account", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Button(
+                        onClick = onBack,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .semantics { contentDescription = "Back button" },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFFFF4081),
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = null, modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Back to Login", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
             }
         }
@@ -582,6 +869,10 @@ fun TaskScreen(
     onLogout: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val tasks by viewModel.tasks.collectAsState()
+    val recordedVideos by viewModel.recordedVideos.collectAsState()
+    val filteredVideos = recordedVideos.filter { it.userId == user.id }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -610,15 +901,17 @@ fun TaskScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            if (viewModel.tasks.isEmpty()) {
+            if (tasks.isEmpty()) {
                 Text(
                     "No tasks available.",
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.semantics { contentDescription = "No tasks message" }
                 )
             } else {
-                LazyColumn {
-                    items(viewModel.tasks) { task ->
+                LazyColumn(
+                    modifier = Modifier.weight(1f, fill = false)
+                ) {
+                    items(tasks) { task ->
                         TaskCard(
                             task = task,
                             onRecordClick = { onNavigateToVideoRecord(task.id) }
@@ -641,26 +934,29 @@ fun TaskScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            if (viewModel.recordedVideos.isEmpty()) {
+            if (filteredVideos.isEmpty()) {
                 Text(
                     "No videos recorded yet.",
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.semantics { contentDescription = "No videos message" }
                 )
             } else {
-                LazyColumn {
-                    items(viewModel.recordedVideos.filter { it.userId == user.id }) { video ->
+                LazyColumn(
+                    modifier = Modifier.weight(1f, fill = false)
+                ) {
+                    items(filteredVideos) { video ->
                         VideoItem(
                             videoPath = video.path,
                             onPlayClick = { onNavigateToPlayback(video.path) },
-                            isApproved = video.isApproved
+                            isApproved = video.isApproved,
+                            completionNote = video.completionNote
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(16.dp))
 
             Button(
                 onClick = onNavigateToPoints,
@@ -689,7 +985,7 @@ fun TaskScreen(
                     .semantics { contentDescription = "Logout button" },
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFFEF5350), // Red for logout
+                    containerColor = Color(0xFFEF5350),
                     contentColor = Color.White
                 )
             ) {
@@ -718,6 +1014,8 @@ fun AdminScreen(
     var newTaskDescription by remember { mutableStateOf("") }
     var newTaskPoints by remember { mutableStateOf("") }
     var newTaskDuration by remember { mutableStateOf("30") }
+    val tasks by viewModel.tasks.collectAsState()
+    val recordedVideos by viewModel.recordedVideos.collectAsState()
 
     Scaffold(
         topBar = {
@@ -758,15 +1056,17 @@ fun AdminScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            if (viewModel.tasks.isEmpty()) {
+            if (tasks.isEmpty()) {
                 Text(
                     "No tasks available.",
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.semantics { contentDescription = "No tasks message" }
                 )
             } else {
-                LazyColumn {
-                    items(viewModel.tasks) { task ->
+                LazyColumn(
+                    modifier = Modifier.weight(1f, fill = false)
+                ) {
+                    items(tasks) { task ->
                         TaskCard(
                             task = task,
                             isAdmin = true,
@@ -790,20 +1090,23 @@ fun AdminScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            if (viewModel.recordedVideos.isEmpty()) {
+            if (recordedVideos.isEmpty()) {
                 Text(
                     "No videos recorded yet.",
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.semantics { contentDescription = "No videos message" }
                 )
             } else {
-                LazyColumn {
-                    items(viewModel.recordedVideos) { video ->
+                LazyColumn(
+                    modifier = Modifier.weight(1f, fill = false)
+                ) {
+                    items(recordedVideos) { video ->
                         VideoItem(
                             videoPath = video.path,
                             onPlayClick = { onNavigateToPlayback(video.path) },
                             isAdmin = true,
                             isApproved = video.isApproved,
+                            completionNote = video.completionNote,
                             onApproveClick = {
                                 viewModel.viewModelScope.launch {
                                     val wasApproved = video.isApproved
@@ -835,7 +1138,7 @@ fun AdminScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(16.dp))
 
             Button(
                 onClick = onNavigateToPoints,
@@ -1004,11 +1307,14 @@ fun AdminScreen(
 @Composable
 fun PointsScreen(
     user: User,
-    recordedVideos: List<VideoMetadata>,
+    recordedVideos: StateFlow<List<VideoMetadata>>,
     onNavigateToPlayback: (String) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val videos by recordedVideos.collectAsState()
+    val filteredVideos = videos.filter { it.userId == user.id }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -1108,26 +1414,29 @@ fun PointsScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            if (recordedVideos.isEmpty()) {
+            if (filteredVideos.isEmpty()) {
                 Text(
                     "No videos recorded yet.",
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.semantics { contentDescription = "No videos message" }
                 )
             } else {
-                LazyColumn {
-                    items(recordedVideos.filter { it.userId == user.id }) { video ->
+                LazyColumn(
+                    modifier = Modifier.weight(1f, fill = false)
+                ) {
+                    items(filteredVideos) { video ->
                         VideoItem(
                             videoPath = video.path,
                             onPlayClick = { onNavigateToPlayback(video.path) },
-                            isApproved = video.isApproved
+                            isApproved = video.isApproved,
+                            completionNote = video.completionNote
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(16.dp))
 
             Button(
                 onClick = onBack,
@@ -1157,6 +1466,7 @@ fun VideoRecordScreen(
     analytics: FirebaseAnalytics,
     userId: String,
     onBack: () -> Unit,
+    onNavigateToCompletionNote: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -1173,7 +1483,7 @@ fun VideoRecordScreen(
     var recording by remember { mutableStateOf<Recording?>(null) }
     var showPermissionDeniedDialog by remember { mutableStateOf(false) }
 
-    val task = viewModel.tasks.find { it.id == taskId }
+    val task = viewModel.tasks.collectAsState().value.find { it.id == taskId }
     val taskDuration = (task?.durationSeconds?.toLong()?.times(1000L) ?: 30000L).coerceAtLeast(1000L)
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -1344,19 +1654,11 @@ fun VideoRecordScreen(
                                                     }
                                                 } else {
                                                     recordingSuccess = "Video saved successfully"
-                                                    viewModel.viewModelScope.launch {
-                                                        viewModel.addVideo(
-                                                            VideoMetadata(
-                                                                path = videoFile.absolutePath,
-                                                                taskId = taskId,
-                                                                timestamp = System.currentTimeMillis(),
-                                                                userId = userId
-                                                            )
-                                                        )
-                                                    }
+                                                    val videoPath = videoFile.absolutePath
+                                                    onNavigateToCompletionNote(videoPath)
                                                     analytics.logEvent("video_record_success") {
                                                         param("task_id", taskId)
-                                                        param("video_path", videoFile.absolutePath)
+                                                        param("video_path", videoPath)
                                                     }
                                                 }
                                             }
@@ -1429,13 +1731,13 @@ fun VideoRecordScreen(
             if (recordingSuccess != null) {
                 Text(
                     recordingSuccess!!,
-                    color = Color(0xFF4CAF50), // Green for success
+                    color = Color(0xFF4CAF50),
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.semantics { contentDescription = "Recording success message: $recordingSuccess" }
                 )
             }
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(16.dp))
 
             Button(
                 onClick = onBack,
@@ -1497,6 +1799,172 @@ fun VideoRecordScreen(
             executor.shutdown()
             recording?.stop()
             timer?.cancel()
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun CompletionNoteScreen(
+    taskId: String,
+    videoPath: String,
+    viewModel: TaskViewModel,
+    analytics: FirebaseAnalytics,
+    userId: String,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var completionNote by remember { mutableStateOf("") }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isLoading by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Add Completion Note - Task $taskId", color = Color.White) },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color(0xFF3F51B5)
+                ),
+                navigationIcon = {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.semantics { contentDescription = "Back button" }
+                    ) {
+                        Icon(
+                            Icons.Default.ArrowBack,
+                            contentDescription = "Navigate back",
+                            tint = Color.White
+                        )
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(MaterialTheme.colorScheme.background)
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                shape = RoundedCornerShape(16.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        "Write a note about your task completion",
+                        style = MaterialTheme.typography.bodyLarge.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF3F51B5)
+                        ),
+                        modifier = Modifier.semantics { contentDescription = "Instruction for completion note" }
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = completionNote,
+                        onValueChange = { completionNote = it },
+                        label = { Text("Completion Note") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(150.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .semantics { contentDescription = "Completion note input field" },
+                        enabled = !isLoading,
+                        colors = TextFieldDefaults.colors(
+                            focusedIndicatorColor = Color(0xFF3F51B5),
+                            focusedLabelColor = Color(0xFF3F51B5),
+                            unfocusedContainerColor = Color.Transparent
+                        )
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    if (errorMessage != null) {
+                        Text(
+                            errorMessage!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.semantics { contentDescription = "Error message: $errorMessage" }
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    Button(
+                        onClick = {
+                            if (completionNote.isBlank()) {
+                                errorMessage = "Completion note cannot be empty"
+                                return@Button
+                            }
+                            isLoading = true
+                            errorMessage = null
+                            viewModel.viewModelScope.launch {
+                                viewModel.addVideo(
+                                    VideoMetadata(
+                                        path = videoPath,
+                                        taskId = taskId,
+                                        timestamp = System.currentTimeMillis(),
+                                        userId = userId,
+                                        completionNote = completionNote
+                                    )
+                                )
+                                analytics.logEvent("completion_note_added") {
+                                    param("task_id", taskId)
+                                    param("video_path", videoPath)
+                                }
+                                isLoading = false
+                                Toast.makeText(context, "Note submitted successfully", Toast.LENGTH_SHORT).show()
+                                onBack()
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .semantics { contentDescription = "Submit note button" },
+                        shape = RoundedCornerShape(12.dp),
+                        enabled = !isLoading,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF3F51B5),
+                            contentColor = Color.White
+                        )
+                    ) {
+                        if (isLoading) {
+                            CircularProgressIndicator(color = Color.White)
+                        } else {
+                            Text("Submit Note", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Button(
+                        onClick = onBack,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .semantics { contentDescription = "Back button" },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFFFF4081),
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = null, modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Back", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
         }
     }
 }
@@ -1582,7 +2050,7 @@ fun VideoPlaybackScreen(
                 )
             }
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(16.dp))
 
             Button(
                 onClick = onBack,
@@ -1634,7 +2102,7 @@ fun TaskCard(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    task.title,
+                    task.title.takeIf { it.isNotBlank() } ?: "Untitled Task",
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.Bold,
                         color = Color(0xFF3F51B5)
@@ -1643,7 +2111,7 @@ fun TaskCard(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    task.description,
+                    task.description.takeIf { it.isNotBlank() } ?: "No description",
                     style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF757575)),
                     modifier = Modifier.semantics { contentDescription = "Task description: ${task.description}" }
                 )
@@ -1694,6 +2162,7 @@ fun VideoItem(
     onPlayClick: () -> Unit,
     isAdmin: Boolean = false,
     isApproved: Boolean = false,
+    completionNote: String = "",
     onApproveClick: () -> Unit = {},
     onShareClick: @Composable () -> Unit = {}
 ) {
@@ -1706,65 +2175,77 @@ fun VideoItem(
             containerColor = Color.White
         )
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .padding(16.dp)
         ) {
-            Text(
-                videoPath.substringAfterLast("/"),
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold, color = Color(0xFF3F51B5)),
-                modifier = Modifier
-                    .weight(1f)
-                    .semantics { contentDescription = "Video file name: ${videoPath.substringAfterLast("/")}" }
-            )
-            if (isAdmin) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
-                    if (isApproved) "Approved" else "Pending",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (isApproved) Color(0xFF4CAF50) else Color(0xFFFFA726),
-                    modifier = Modifier.semantics { contentDescription = "Approval status: ${if (isApproved) "Approved" else "Pending"}" }
+                    videoPath.substringAfterLast("/").takeIf { it.isNotBlank() } ?: "Unnamed Video",
+                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold, color = Color(0xFF3F51B5)),
+                    modifier = Modifier
+                        .weight(1f)
+                        .semantics { contentDescription = "Video file name: ${videoPath.substringAfterLast("/")}" }
                 )
-                Spacer(modifier = Modifier.width(8.dp))
-                IconButton(
-                    onClick = onApproveClick,
-                    modifier = Modifier.semantics { contentDescription = if (isApproved) "Unapprove video button" else "Approve video button" }
-                ) {
-                    Icon(
-                        Icons.Default.CheckCircle,
-                        contentDescription = if (isApproved) "Unapprove video" else "Approve video",
-                        tint = if (isApproved) Color(0xFF757575) else Color(0xFF4CAF50)
+                if (isAdmin) {
+                    Text(
+                        if (isApproved) "Approved" else "Pending",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (isApproved) Color(0xFF4CAF50) else Color(0xFFFFA726),
+                        modifier = Modifier.semantics { contentDescription = "Approval status: ${if (isApproved) "Approved" else "Pending"}" }
                     )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    IconButton(
+                        onClick = onApproveClick,
+                        modifier = Modifier.semantics { contentDescription = if (isApproved) "Unapprove video button" else "Approve video button" }
+                    ) {
+                        Icon(
+                            Icons.Default.CheckCircle,
+                            contentDescription = if (isApproved) "Unapprove video" else "Approve video",
+                            tint = if (isApproved) Color(0xFF757575) else Color(0xFF4CAF50)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    IconButton(
+                        onClick = onShareClick as () -> Unit,
+                        modifier = Modifier.semantics { contentDescription = "Share video button" }
+                    ) {
+                        Icon(
+                            Icons.Default.Share,
+                            contentDescription = "Share video",
+                            tint = Color(0xFF3F51B5)
+                        )
+                    }
+                } else {
+                    Text(
+                        if (isApproved) "Approved" else "Pending Approval",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (isApproved) Color(0xFF4CAF50) else Color(0xFFFFA726),
+                        modifier = Modifier.semantics { contentDescription = "Approval status: ${if (isApproved) "Approved" else "Pending Approval"}" }
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
                 }
-                Spacer(modifier = Modifier.width(8.dp))
                 IconButton(
-                    onClick = onShareClick as () -> Unit,
-                    modifier = Modifier.semantics { contentDescription = "Share video button" }
+                    onClick = onPlayClick,
+                    modifier = Modifier.semantics { contentDescription = "Play video button" }
                 ) {
                     Icon(
-                        Icons.Default.Share,
-                        contentDescription = "Share video",
+                        Icons.Default.PlayArrow,
+                        contentDescription = "Play video",
                         tint = Color(0xFF3F51B5)
                     )
                 }
-            } else {
-                Text(
-                    if (isApproved) "Approved" else "Pending Approval",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (isApproved) Color(0xFF4CAF50) else Color(0xFFFFA726),
-                    modifier = Modifier.semantics { contentDescription = "Approval status: ${if (isApproved) "Approved" else "Pending Approval"}" }
-                )
-                Spacer(modifier = Modifier.width(8.dp))
             }
-            IconButton(
-                onClick = onPlayClick,
-                modifier = Modifier.semantics { contentDescription = "Play video button" }
-            ) {
-                Icon(
-                    Icons.Default.PlayArrow,
-                    contentDescription = "Play video",
-                    tint = Color(0xFF3F51B5)
+            if (completionNote.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Completion Note: $completionNote",
+                    style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF757575)),
+                    modifier = Modifier.semantics { contentDescription = "Completion note: $completionNote" }
                 )
             }
         }
