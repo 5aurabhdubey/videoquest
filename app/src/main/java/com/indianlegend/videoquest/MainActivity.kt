@@ -107,17 +107,18 @@ data class User(
     val points: Int = 0
 )
 
+// Updated VideoMetadata to match Firestore document fields
 data class VideoMetadata(
     val id: String = "",
-    val videoUrl: String = "",
+    val videourl: String = "", // Matches Firestore 'videourl'
     val taskId: String = "",
-    val timestamp: Long = 0,
-    val isApproved: Boolean = false,
     val userId: String = "",
-    val completionNote: String = ""
+    val submittedAt: Long = 0, // Matches Firestore 'submittedAt'
+    val status: String = "pending", // Matches Firestore 'status' (replaces isApproved)
+    val completionNote: String = "",
+    val uploadFailed: Boolean = false // Matches Firestore 'uploadFailed'
 )
 
-// TaskViewModel
 class TaskViewModel : ViewModel() {
     private val firestore = FirebaseFirestore.getInstance()
     private val storage = FirebaseStorage.getInstance()
@@ -141,20 +142,26 @@ class TaskViewModel : ViewModel() {
 
     fun refreshData() {
         viewModelScope.launch {
-            // Fetch tasks from Firestore
-            val tasksSnapshot = firestore.collection("tasks").get().await()
-            _tasks.value = tasksSnapshot.documents.mapNotNull { doc ->
-                doc.toObject(Task::class.java)?.copy(id = doc.id)
-            }
-            // Fetch videos
-            val videosSnapshot = firestore.collection("videos").get().await()
-            _recordedVideos.value = videosSnapshot.documents.mapNotNull { doc ->
-                doc.toObject(VideoMetadata::class.java)?.copy(id = doc.id)
-            }
-            // Fetch user data
-            _user.value?.id?.let { userId ->
-                val userDoc = firestore.collection("users").document(userId).get().await()
-                _user.value = userDoc.toObject(User::class.java)
+            try {
+                // Fetch tasks from Firestore
+                val tasksSnapshot = firestore.collection("tasks").get().await()
+                _tasks.value = tasksSnapshot.documents.mapNotNull { doc ->
+                    doc.toObject(Task::class.java)?.copy(id = doc.id)
+                }
+                // Fetch videos
+                val videosSnapshot = firestore.collection("videos").get().await()
+                _recordedVideos.value = videosSnapshot.documents.mapNotNull { doc ->
+                    doc.toObject(VideoMetadata::class.java)?.copy(id = doc.id)
+                }
+                // Fetch user data with validation
+                _user.value?.id?.takeIf { it.isNotBlank() }?.let { userId ->
+                    val userDoc = firestore.collection("users").document(userId).get().await()
+                    if (userDoc.exists()) {
+                        _user.value = userDoc.toObject(User::class.java)?.copy(id = userId)
+                    }
+                }
+            } catch (e: Exception) {
+                // Silent error handling to prevent crashes
             }
         }
     }
@@ -174,6 +181,7 @@ class TaskViewModel : ViewModel() {
         firestore.collection("tasks").document(task.id).delete().await()
         _tasks.value = _tasks.value - task
     }
+
     suspend fun uploadVideo(
         videoPath: String,
         taskId: String,
@@ -196,12 +204,13 @@ class TaskViewModel : ViewModel() {
                         val videoUrl = storageRef.downloadUrl.await().toString()
                         val videoMetadata = VideoMetadata(
                             id = "",
-                            videoUrl = videoUrl,
+                            videourl = videoUrl,
                             taskId = taskId,
                             userId = userId,
-                            timestamp = System.currentTimeMillis(),
-                            isApproved = false,
-                            completionNote = completionNote
+                            submittedAt = System.currentTimeMillis(),
+                            status = "pending",
+                            completionNote = completionNote,
+                            uploadFailed = false
                         )
                         val docRef = firestore.collection("videos").add(videoMetadata).await()
                         _recordedVideos.value = _recordedVideos.value + videoMetadata.copy(id = docRef.id)
@@ -210,10 +219,10 @@ class TaskViewModel : ViewModel() {
                 } catch (e: StorageException) {
                     if (e.errorCode == StorageException.ERROR_OBJECT_NOT_FOUND && retryCount < maxRetries - 1) {
                         retryCount++
-                        delay(1000L * retryCount) // Exponential backoff
+                        delay(1000L * retryCount)
                         continue
                     } else {
-                        throw e
+                        return null
                     }
                 }
             }
@@ -225,9 +234,9 @@ class TaskViewModel : ViewModel() {
 
     suspend fun approveVideo(videoId: String, isApproved: Boolean) {
         firestore.collection("videos").document(videoId)
-            .update("isApproved", isApproved).await()
+            .update("status", if (isApproved) "approved" else "pending").await()
         _recordedVideos.value = _recordedVideos.value.map {
-            if (it.id == videoId) it.copy(isApproved = isApproved) else it
+            if (it.id == videoId) it.copy(status = if (isApproved) "approved" else "pending") else it
         }
         if (isApproved) {
             val video = _recordedVideos.value.find { it.id == videoId }
@@ -1040,9 +1049,9 @@ fun TaskScreen(
                 ) {
                     items(filteredVideos) { video ->
                         VideoItem(
-                            videoUrl = video.videoUrl,
-                            onPlayClick = { onNavigateToPlayback(video.videoUrl) },
-                            isApproved = video.isApproved,
+                            videourl = video.videourl,
+                            onPlayClick = { onNavigateToPlayback(video.videourl) },
+                            status = video.status,
                             completionNote = video.completionNote
                         )
                         Spacer(modifier = Modifier.height(8.dp))
@@ -1207,16 +1216,16 @@ fun AdminScreen(
                 ) {
                     items(recordedVideos) { video ->
                         VideoItem(
-                            videoUrl = video.videoUrl,
-                            onPlayClick = { onNavigateToPlayback(video.videoUrl) },
+                            videourl = video.videourl,
+                            onPlayClick = { onNavigateToPlayback(video.videourl) },
                             isAdmin = true,
-                            isApproved = video.isApproved,
+                            status = video.status,
                             completionNote = video.completionNote,
                             onApproveClick = {
                                 viewModel.viewModelScope.launch {
-                                    val wasApproved = video.isApproved
-                                    viewModel.approveVideo(video.id, !video.isApproved)
-                                    if (!wasApproved && !video.isApproved) {
+                                    val wasApproved = video.status == "approved"
+                                    viewModel.approveVideo(video.id, !wasApproved)
+                                    if (!wasApproved) {
                                         val pointsToAdd = viewModel.getTaskPoints(video.taskId)
                                         onUserPointsUpdate(user.points + pointsToAdd)
                                     }
@@ -1531,9 +1540,9 @@ fun PointsScreen(
                 ) {
                     items(filteredVideos) { video ->
                         VideoItem(
-                            videoUrl = video.videoUrl,
-                            onPlayClick = { onNavigateToPlayback(video.videoUrl) },
-                            isApproved = video.isApproved,
+                            videourl = video.videourl,
+                            onPlayClick = { onNavigateToPlayback(video.videourl) },
+                            status = video.status,
                             completionNote = video.completionNote
                         )
                         Spacer(modifier = Modifier.height(8.dp))
@@ -1567,6 +1576,107 @@ fun PointsScreen(
     }
 }
 
+@Composable
+fun VideoItem(
+    videourl: String,
+    onPlayClick: () -> Unit,
+    isAdmin: Boolean = false,
+    status: String = "pending",
+    completionNote: String = "",
+    onApproveClick: () -> Unit = {},
+    onShareClick: @Composable () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .shadow(4.dp, RoundedCornerShape(12.dp)),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = Color.White
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    videourl.substringAfterLast("/").takeIf { it.isNotBlank() } ?: "Unnamed Video",
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF3F51B5)
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .semantics { contentDescription = "Video file name: ${videourl.substringAfterLast("/")}" }
+                )
+                if (isAdmin) {
+                    Text(
+                        if (status == "approved") "Approved" else "Pending",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (status == "approved") Color(0xFF4CAF50) else Color(0xFFFFA726),
+                        modifier = Modifier.semantics {
+                            contentDescription = "Approval status: ${if (status == "approved") "Approved" else "Pending"}"
+                        }
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    IconButton(
+                        onClick = onApproveClick,
+                        modifier = Modifier.semantics {
+                            contentDescription = if (status == "approved") "Unapprove video button" else "Approve video button"
+                        }
+                    ) {
+                        Icon(
+                            Icons.Default.CheckCircle,
+                            contentDescription = if (status == "approved") "Unapprove video" else "Approve video",
+                            tint = if (status == "approved") Color(0xFFEF5350) else Color(0xFF4CAF50)
+                        )
+                    }
+                    IconButton(
+                        onClick = { /* Handled via composable lambda */ },
+                        modifier = Modifier.semantics { contentDescription = "Share video button" }
+                    ) {
+                        onShareClick()
+                    }
+                } else {
+                    Text(
+                        if (status == "approved") "Approved" else "Pending",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (status == "approved") Color(0xFF4CAF50) else Color(0xFFFFA726),
+                        modifier = Modifier
+                            .semantics {
+                                contentDescription = "Approval status: ${if (status == "approved") "Approved" else "Pending"}"
+                            }
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    IconButton(
+                        onClick = onPlayClick,
+                        modifier = Modifier.semantics { contentDescription = "Play video button" }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = "Play video",
+                            tint = Color(0xFF3F51B5)
+                        )
+                    }
+                }
+            }
+            if (completionNote.isNotBlank()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Note: $completionNote",
+                    style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF757575)),
+                    modifier = Modifier.semantics { contentDescription = "Completion note: $completionNote" }
+                )
+            }
+        }
+    }
+}
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VideoRecordScreen(
