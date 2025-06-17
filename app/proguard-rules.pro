@@ -33,3 +33,9 @@
 # CameraX (used in VideoRecordScreen)
 -keep class androidx.camera.** { *; }
 -dontwarn androidx.camera.**
+
+-keepattributes Signature
+-keepattributes *Annotation*
+
+-keep class com.amazonaws.** { *; }
+-dontwarn com.amazonaws.**
