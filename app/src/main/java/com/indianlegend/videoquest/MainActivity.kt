@@ -7,6 +7,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.provider.Settings
+import android.util.Base64
+import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -58,6 +60,7 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.*
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.clickable
 import androidx.core.app.ActivityCompat.shouldShowRequestPermissionRationale
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -66,16 +69,13 @@ import androidx.media3.common.util.UnstableApi
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import com.amazonaws.auth.BasicAWSCredentials
-import com.amazonaws.client.builder.AwsClientBuilder
-import com.amazonaws.services.s3.AmazonS3Client
-import com.amazonaws.services.s3.AmazonS3ClientBuilder
 import com.google.firebase.analytics.FirebaseAnalytics
 import com.google.firebase.analytics.ktx.analytics
 import com.google.firebase.analytics.ktx.logEvent
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.ktx.auth
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import kotlinx.coroutines.Dispatchers
@@ -86,11 +86,20 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
+import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import com.indianlegend.videoquest.BuildConfig
+import okhttp3.RequestBody
+import java.io.InputStream
+import java.security.MessageDigest
 
 // Data Models
 data class Task(
@@ -110,7 +119,7 @@ data class User(
 
 data class VideoMetadata(
     val id: String = "",
-    val videourl: String = "",
+    val videourl: String = "", // Stores B2 fileName (e.g., "userId-taskId-timestamp.mp4")
     val taskId: String = "",
     val userId: String = "",
     val submittedAt: Long = 0,
@@ -121,6 +130,13 @@ data class VideoMetadata(
 
 class TaskViewModel : ViewModel() {
     private val firestore = FirebaseFirestore.getInstance()
+    private val client = OkHttpClient()
+    private val bucketId = "cb6c247adda56ffd9d7e0b1b"
+    private val bucketName = "videoquest-app-videos-2025"
+    private var authToken: String? = null
+    private var apiUrl: String? = null
+    private var uploadUrl: String? = null
+    private var uploadAuthToken: String? = null
 
     private val _tasks = MutableStateFlow<List<Task>>(emptyList())
     val tasks: StateFlow<List<Task>> = _tasks.asStateFlow()
@@ -134,20 +150,7 @@ class TaskViewModel : ViewModel() {
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
-    // Backblaze B2 client setup
-    // SECURITY NOTE: Replace hardcoded credentials with secure retrieval (e.g., backend API or AWS Secrets Manager)
-    private val b2Client: AmazonS3Client = AmazonS3ClientBuilder
-        .standard()
-        .withCredentials(BasicAWSCredentials("your-keyID", "your-applicationKey"))
-        .withEndpointConfiguration(
-            AwsClientBuilder.EndpointConfiguration(
-                "s3.us-east-005.backblazeb2.com",
-                "us-east-005"
-            )
-        )
-        .build()
-
-    private val bucketName = "videoquest-app-videos-2025"
+    private val auth = FirebaseAuth.getInstance()
 
     init {
         refreshData()
@@ -163,23 +166,58 @@ class TaskViewModel : ViewModel() {
 
     fun refreshData() {
         viewModelScope.launch {
-            try {
-                val tasksSnapshot = firestore.collection("tasks").get().await()
-                _tasks.value = tasksSnapshot.documents.mapNotNull { doc ->
-                    doc.toObject(Task::class.java)?.copy(id = doc.id)
-                }
-                val videosSnapshot = firestore.collection("videos").get().await()
-                _recordedVideos.value = videosSnapshot.documents.mapNotNull { doc ->
-                    doc.toObject(VideoMetadata::class.java)?.copy(id = doc.id)
-                }
-                _user.value?.id?.takeIf { it.isNotBlank() }?.let { userId ->
-                    val userDoc = firestore.collection("users").document(userId).get().await()
-                    if (userDoc.exists()) {
-                        _user.value = userDoc.toObject(User::class.java)?.copy(id = userId)
+            var attempt = 0
+            val MAX_ATTEMPTS = 3
+            while (attempt < MAX_ATTEMPTS) {
+                try {
+                    val tasksSnapshot = firestore.collection("tasks").get().await()
+                    _tasks.value = tasksSnapshot.documents.mapNotNull { doc ->
+                        doc.toObject(Task::class.java)?.copy(id = doc.id)
                     }
+                    val videosSnapshot = firestore.collection("videos").get().await()
+                    _recordedVideos.value = videosSnapshot.documents.mapNotNull { doc ->
+                        doc.toObject(VideoMetadata::class.java)?.copy(id = doc.id)
+                    }
+                    auth.currentUser?.uid?.let { userId ->
+                        val userDoc = firestore.collection("users").document(userId).get().await()
+                        if (userDoc.exists()) {
+                            _user.value = userDoc.toObject(User::class.java)?.copy(id = userId)
+                        } else {
+                            val newUser = User(
+                                id = userId,
+                                email = auth.currentUser?.email ?: "",
+                                role = if (auth.currentUser?.email == "admin@example.com") "admin" else "user",
+                                points = 50
+                            )
+                            firestore.collection("users").document(userId).set(newUser).await()
+                            _user.value = newUser
+                        }
+                    }
+                    _errorMessage.value = null
+                    break
+                } catch (e: FirebaseFirestoreException) {
+                    attempt++
+                    when (e.code) {
+                        FirebaseFirestoreException.Code.PERMISSION_DENIED -> {
+                            _errorMessage.value = "Failed to load data: PERMISSION_DENIED: Check Firestore rules."
+                            break
+                        }
+                        FirebaseFirestoreException.Code.UNAVAILABLE -> {
+                            _errorMessage.value = "Network error, retrying... (Attempt $attempt/$MAX_ATTEMPTS)"
+                            delay(2000L * attempt)
+                            if (attempt == MAX_ATTEMPTS) {
+                                _errorMessage.value = "Failed to load data: Network unavailable after $MAX_ATTEMPTS attempts."
+                            }
+                        }
+                        else -> {
+                            _errorMessage.value = "Failed to load data: ${e.message}"
+                            break
+                        }
+                    }
+                } catch (e: Exception) {
+                    _errorMessage.value = "Failed to load data: ${e.message}"
+                    break
                 }
-            } catch (e: Exception) {
-                _errorMessage.value = "Failed to load data: ${e.message}"
             }
         }
     }
@@ -211,83 +249,177 @@ class TaskViewModel : ViewModel() {
         }
     }
 
-    suspend fun deleteVideo(video: VideoMetadata) {
-        try {
-            firestore.collection("videos").document(video.id).delete().await()
-            b2Client.deleteObject(bucketName, video.videourl)
-            _recordedVideos.value = _recordedVideos.value.filter { it.id != video.id }
-        } catch (e: Exception) {
-            _errorMessage.value = "Failed to delete video: ${e.message}"
-            throw e
+    private suspend fun authenticate() = withContext(Dispatchers.IO) {
+        val credentials = Base64.encodeToString(
+            "${BuildConfig.B2_KEY_ID}:${BuildConfig.B2_APPLICATION_KEY}".toByteArray(),
+            Base64.NO_WRAP
+        )
+        val request = Request.Builder()
+            .url("https://api.backblazeb2.com/b2api/v2/b2_authorize_account")
+            .header("Authorization", "Basic $credentials")
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (response.isSuccessful) {
+                val json = JSONObject(response.body?.string() ?: "")
+                authToken = json.getString("authorizationToken")
+                apiUrl = json.getString("apiUrl")
+                uploadUrl = null
+            } else {
+                throw Exception("Authentication failed: ${response.message}")
+            }
+        }
+    }
+
+    private suspend fun getUploadUrl(): String = withContext(Dispatchers.IO) {
+        if (authToken == null || apiUrl == null) authenticate()
+        val requestBody = JSONObject().put("bucketId", bucketId).toString()
+        val request = Request.Builder()
+            .url("$apiUrl/b2api/v2/b2_get_upload_url")
+            .header("Authorization", authToken!!)
+            .post(RequestBody.create("application/json".toMediaType(), requestBody))
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (response.isSuccessful) {
+                val json = JSONObject(response.body?.string() ?: "")
+                uploadAuthToken = json.getString("authorizationToken")
+                json.getString("uploadUrl")
+            } else {
+                throw Exception("Failed to get upload URL: ${response.message}")
+            }
         }
     }
 
     suspend fun uploadVideo(
         videoPath: String,
         taskId: String,
-        userId: String,
+        userId: String = "anonymous", // Default to anonymous if no user
         completionNote: String
     ): String? {
-        return try {
-            val videoFile = File(videoPath)
-            if (!videoFile.exists()) {
-                _errorMessage.value = "Video file not found"
-                return null
-            }
+        val videoFile = File(videoPath)
+        if (!videoFile.exists()) {
+            _errorMessage.value = "Video file not found"
+            return null
+        }
 
-            val fileName = "videos/${UUID.randomUUID()}.mp4"
-            var retryCount = 0
-            val maxRetries = 3
+        val fileName = "$userId-$taskId-${System.currentTimeMillis()}.mp4"
+        val sha1 = videoFile.inputStream().use { it.digestSha1() }
+        var retryCount = 0
+        val maxRetries = 3
+        var result: String? = null
 
-            while (retryCount < maxRetries) {
-                try {
-                    b2Client.putObject(bucketName, fileName, videoFile)
+        while (retryCount < maxRetries && result == null) {
+            try {
+                val uploadUrl = getUploadUrl()
+                val request = Request.Builder()
+                    .url(uploadUrl)
+                    .header("Authorization", uploadAuthToken!!)
+                    .header("X-Bz-File-Name", fileName)
+                    .header("Content-Type", "video/mp4")
+                    .header("X-Bz-Content-Sha1", sha1)
+                    .header("X-Bz-Info-b2-content-disposition", "attachment; filename=\"$fileName\"")
+                    .post(videoFile.asRequestBody("video/mp4".toMediaType()))
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val videoId = fileName
+                        val videoMetadata = VideoMetadata(
+                            id = "",
+                            videourl = fileName,
+                            taskId = taskId,
+                            userId = userId,
+                            submittedAt = System.currentTimeMillis(),
+                            status = "pending",
+                            completionNote = completionNote,
+                            uploadFailed = false
+                        )
+                        val docRef = firestore.collection("videos").add(videoMetadata).await()
+                        _recordedVideos.value = _recordedVideos.value + videoMetadata.copy(id = docRef.id)
 
-                    val videoMetadata = VideoMetadata(
-                        id = "",
-                        videourl = fileName,
-                        taskId = taskId,
-                        userId = userId,
-                        submittedAt = System.currentTimeMillis(),
-                        status = "pending",
-                        completionNote = completionNote,
-                        uploadFailed = false
-                    )
-                    val docRef = firestore.collection("videos").add(videoMetadata).await()
-                    _recordedVideos.value = _recordedVideos.value + videoMetadata.copy(id = docRef.id)
+                        if (videoFile.exists()) videoFile.delete()
 
-                    if (videoFile.exists()) {
-                        videoFile.delete()
-                    }
-
-                    return docRef.id
-                } catch (e: Exception) {
-                    if (retryCount < maxRetries - 1) {
-                        retryCount++
-                        delay(1000L * retryCount)
-                        continue
+                        result = docRef.id
                     } else {
-                        _errorMessage.value = "Failed to upload video after retries: ${e.message}"
-                        return null
+                        _errorMessage.value = "Upload failed: ${response.message}"
                     }
                 }
+                if (result == null && retryCount < maxRetries - 1) {
+                    retryCount++
+                    delay(1000L * retryCount)
+                }
+            } catch (e: Exception) {
+                _errorMessage.value = "Upload failed: ${e.message}"
+                if (result == null && retryCount < maxRetries - 1) {
+                    retryCount++
+                    delay(1000L * retryCount)
+                }
             }
-            null
-        } catch (e: Exception) {
-            _errorMessage.value = "Failed to upload video: ${e.message}"
-            null
+        }
+        return result
+    }
+
+    suspend fun getVideoDownloadUrl(fileName: String): String? = withContext(Dispatchers.IO) {
+        if (authToken == null || apiUrl == null) authenticate()
+        val request = Request.Builder()
+            .url("$apiUrl/b2api/v2/b2_get_download_authorization")
+            .header("Authorization", authToken!!)
+            .post(
+                RequestBody.create(
+                    "application/json".toMediaType(),
+                    JSONObject()
+                        .put("bucketId", bucketId)
+                        .put("fileNamePrefix", fileName)
+                        .put("validDurationInSeconds", 3600)
+                        .toString()
+                )
+            )
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (response.isSuccessful) {
+                val json = JSONObject(response.body?.string() ?: "")
+                val downloadToken = json.getString("authorizationToken")
+                "https://f005.backblazeb2.com/file/$bucketName/$fileName?Authorization=$downloadToken"
+            } else {
+                _errorMessage.value = "Failed to generate video URL: ${response.message}"
+                null
+            }
         }
     }
 
-    suspend fun getVideoDownloadUrl(fileName: String): String? {
-        return try {
-            val expiration = Date(System.currentTimeMillis() + 3600 * 1000)
-            val url = b2Client.generatePresignedUrl(bucketName, fileName, expiration).toString()
-            url
-        } catch (e: Exception) {
-            _errorMessage.value = "Failed to generate video URL: ${e.message}"
-            null
+    suspend fun deleteVideo(video: VideoMetadata) = withContext(Dispatchers.IO) {
+        if (authToken == null || apiUrl == null) authenticate()
+        val request = Request.Builder()
+            .url("$apiUrl/b2api/v2/b2_delete_file_version")
+            .header("Authorization", authToken!!)
+            .post(
+                RequestBody.create(
+                    "application/json".toMediaType(),
+                    JSONObject()
+                        .put("fileName", video.videourl)
+                        .put("fileId", video.videourl)
+                        .toString()
+                )
+            )
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (response.isSuccessful) {
+                firestore.collection("videos").document(video.id).delete().await()
+                _recordedVideos.value = _recordedVideos.value.filter { it.id != video.id }
+                true
+            } else {
+                _errorMessage.value = "Failed to delete video: ${response.message}"
+                false
+            }
         }
+    }
+
+    private fun InputStream.digestSha1(): String {
+        val digest = MessageDigest.getInstance("SHA1")
+        val buffer = ByteArray(8192)
+        var read: Int
+        while (read(buffer).also { read = it } > 0) {
+            digest.update(buffer, 0, read)
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     suspend fun approveVideo(videoId: String, isApproved: Boolean) {
@@ -362,7 +494,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-
 @Composable
 fun VideoQuestTheme(content: @Composable () -> Unit) {
     MaterialTheme(
@@ -1101,7 +1232,7 @@ fun TaskScreen(
                     items(tasks) { task ->
                         TaskCard(
                             task = task,
-                            onRecordClick = { onNavigateToVideoRecord(task.id) }
+                            onClickListener = { onNavigateToVideoRecord(task.id) }
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                     }
@@ -1300,7 +1431,7 @@ fun AdminScreen(
                         TaskCard(
                             task = task,
                             isAdmin = true,
-                            onDeleteClick = {
+                            onDeleteClickListener = {
                                 showDeleteTaskDialog = task
                                 analytics.logEvent("task_delete_initiated") {
                                     param("task_id", task.id)
@@ -1916,7 +2047,6 @@ fun VideoRecordScreen(
     var hasAudioPermission by remember { mutableStateOf(false) }
     var isRecording by remember { mutableStateOf(false) }
     var recordingError by remember { mutableStateOf<String?>(null) }
-    var recordingSuccess by remember { mutableStateOf<String?>(null) }
     var recordingTime by remember { mutableStateOf(0L) }
     var timer by remember { mutableStateOf<CountDownTimer?>(null) }
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
@@ -2005,6 +2135,14 @@ fun VideoRecordScreen(
         }
     }
 
+    DisposableEffect(Unit) {
+        onDispose {
+            executor.shutdown()
+            timer?.cancel()
+            recording?.stop()
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -2030,7 +2168,7 @@ fun VideoRecordScreen(
         Column(
             modifier = modifier
                 .fillMaxSize()
-                .padding(padding)
+
                 .background(MaterialTheme.colorScheme.background)
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -2049,77 +2187,63 @@ fun VideoRecordScreen(
                             .fillMaxSize()
                             .semantics { contentDescription = "Camera preview" }
                     )
-
-                    if (isRecording) {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(8.dp)
-                                .background(Color(0xFFEF5350), CircleShape)
-                                .padding(horizontal = 12.dp, vertical = 4.dp)
-                        ) {
-                            Text(
-                                "REC ${recordingTime}s / ${taskDuration / 1000}s",
-                                color = Color.White,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.semantics { contentDescription = "Recording timer: $recordingTime seconds of ${taskDuration / 1000} seconds" }
-                            )
-                        }
-                    }
                 }
-
                 Spacer(modifier = Modifier.height(16.dp))
-
+                Text(
+                    "Recording Time: ${recordingTime}s / ${taskDuration / 1000}s",
+                    style = MaterialTheme.typography.bodyLarge.copy(
+                        color = if (isRecording) Color(0xFFFF4081) else Color(0xFF3F51B5)
+                    ),
+                    modifier = Modifier.semantics { contentDescription = "Recording time: $recordingTime seconds of ${taskDuration / 1000} seconds" }
+                )
+                Spacer(modifier = Modifier.height(16.dp))
                 Button(
                     onClick = {
                         if (!isRecording) {
-                            videoCapture?.let { capture ->
-                                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                                val videoFile = File(context.filesDir, "video_$timestamp.mp4")
-                                val outputOptions = FileOutputOptions.Builder(videoFile).build()
+                            val outputFile = File(context.cacheDir, "video_${System.currentTimeMillis()}.mp4")
+                            val outputOptions = FileOutputOptions.Builder(outputFile).build()
 
+                            videoCapture?.let { capture ->
                                 recording = capture.output
                                     .prepareRecording(context, outputOptions)
+                                    .withAudioEnabled()
                                     .start(ContextCompat.getMainExecutor(context)) { event ->
                                         when (event) {
                                             is VideoRecordEvent.Start -> {
                                                 isRecording = true
-                                                recordingError = null
-                                                recordingSuccess = null
-                                                analytics.logEvent("video_record_start") {
+                                                analytics.logEvent("video_recording_started") {
                                                     param("task_id", taskId)
+                                                    param("user_id", userId)
                                                 }
                                             }
                                             is VideoRecordEvent.Finalize -> {
                                                 isRecording = false
+                                                recording = null
                                                 if (event.hasError()) {
                                                     recordingError = "Recording failed: ${event.error}"
-                                                    analytics.logEvent("video_record_error") {
+                                                    analytics.logEvent("video_recording_error") {
+                                                        param("task_id", taskId)
                                                         param("error", event.error.toString())
-                                                        param("task_id", taskId)
                                                     }
+                                                    outputFile.delete()
                                                 } else {
-                                                    recordingSuccess = "Video saved successfully"
-                                                    val videoPath = videoFile.absolutePath
-                                                    onNavigateToCompletionNote(videoPath)
-                                                    analytics.logEvent("video_record_success") {
+                                                    onNavigateToCompletionNote(outputFile.absolutePath)
+                                                    analytics.logEvent("video_recording_completed") {
                                                         param("task_id", taskId)
-                                                        param("video_path", videoPath)
+                                                        param("duration", recordingTime.toString())
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                            } ?: run {
-                                recordingError = "Camera not initialized."
-                                analytics.logEvent("camera_not_initialized") {
-                                    param("task_id", taskId)
-                                }
                             }
                         } else {
                             recording?.stop()
                             isRecording = false
+                            analytics.logEvent("video_recording_stopped") {
+                                param("task_id", taskId)
+                                param("duration", recordingTime.toString())
+                            }
                         }
                     },
                     modifier = Modifier
@@ -2132,20 +2256,34 @@ fun VideoRecordScreen(
                         contentColor = Color.White
                     )
                 ) {
+                    Icon(
+                        imageVector = if (isRecording) Icons.Default.Close else Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         if (isRecording) "Stop Recording" else "Start Recording",
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }
+                Spacer(modifier = Modifier.height(8.dp))
+                if (recordingError != null) {
+                    Text(
+                        recordingError!!,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.semantics { contentDescription = "Recording error: $recordingError" }
+                    )
+                }
             } else {
                 Text(
-                    "Camera and audio permissions required.",
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier.semantics { contentDescription = "Permissions required message" }
+                    "Camera and audio permissions are required to record video.",
+                    style = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.semantics { contentDescription = "Permission required message" }
                 )
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(16.dp))
                 Button(
                     onClick = {
                         permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
@@ -2153,58 +2291,15 @@ fun VideoRecordScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(50.dp)
-                        .semantics { contentDescription = "Retry permissions button" },
+                        .semantics { contentDescription = "Request permissions button" },
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFF3F51B5),
                         contentColor = Color.White
                     )
                 ) {
-                    Text("Retry Permissions", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Request Permissions", fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            if (recordingError != null) {
-                Text(
-                    recordingError!!,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.semantics { contentDescription = "Recording error message: $recordingError" }
-                )
-            }
-
-            if (recordingSuccess != null) {
-                Text(
-                    recordingSuccess!!,
-                    color = Color(0xFF4CAF50),
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.semantics { contentDescription = "Recording success message: $recordingSuccess" }
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Button(
-                onClick = onBack,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(50.dp)
-                    .semantics { contentDescription = "Back button" },
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFFFF4081),
-                    contentColor = Color.White
-                )
-            ) {
-                Icon(
-                    imageVector = Icons.Default.ArrowBack,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Back", fontSize = 16.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -2212,13 +2307,14 @@ fun VideoRecordScreen(
     if (showPermissionDeniedDialog) {
         AlertDialog(
             onDismissRequest = { showPermissionDeniedDialog = false },
-            title = { Text("Permissions Denied") },
-            text = { Text("Camera and audio permissions are permanently denied. Please enable them in Settings.") },
+            title = { Text("Permissions Required") },
+            text = { Text("Camera and audio permissions are required. Please enable them in app settings.") },
             confirmButton = {
                 Button(
                     onClick = {
-                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
-                        intent.data = Uri.parse("package:${context.packageName}")
+                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", context.packageName, null)
+                        }
                         context.startActivity(intent)
                         showPermissionDeniedDialog = false
                     },
@@ -2232,8 +2328,11 @@ fun VideoRecordScreen(
             },
             dismissButton = {
                 Button(
-                    onClick = { showPermissionDeniedDialog = false },
-                    modifier = Modifier.semantics { contentDescription = "Cancel permission dialog button" },
+                    onClick = {
+                        showPermissionDeniedDialog = false
+                        onBack()
+                    },
+                    modifier = Modifier.semantics { contentDescription = "Cancel button" },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFFEF5350)
                     )
@@ -2243,288 +2342,8 @@ fun VideoRecordScreen(
             }
         )
     }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            cameraProviderFuture.get()?.unbindAll()
-            executor.shutdown()
-            recording?.stop()
-            timer?.cancel()
-        }
-    }
 }
 
-@Composable
-fun TaskCard(
-    task: Task,
-    isAdmin: Boolean = false,
-    onRecordClick: () -> Unit = {},
-    onDeleteClick: () -> Unit = {},
-    modifier: Modifier = Modifier
-) {
-    Card(
-        modifier = modifier
-            .fillMaxWidth()
-            .shadow(4.dp, RoundedCornerShape(12.dp)),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = Color.White
-        )
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp)
-        ) {
-            Text(
-                task.title,
-                style = MaterialTheme.typography.bodyLarge.copy(
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFF3F51B5)
-                ),
-                modifier = Modifier.semantics { contentDescription = "Task title: ${task.title}" }
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                task.description,
-                style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF757575)),
-                modifier = Modifier.semantics { contentDescription = "Task description: ${task.description}" }
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                "Points: ${task.points}",
-                style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF4CAF50)),
-                modifier = Modifier.semantics { contentDescription = "Task points: ${task.points}" }
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                "Duration: ${task.durationSeconds} seconds",
-                style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF757575)),
-                modifier = Modifier.semantics { contentDescription = "Task duration: ${task.durationSeconds} seconds" }
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
-            ) {
-                if (!isAdmin) {
-                    Button(
-                        onClick = onRecordClick,
-                        modifier = Modifier
-                            .height(40.dp)
-                            .semantics { contentDescription = "Record video for task button" },
-                        shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF3F51B5),
-                            contentColor = Color.White
-                        )
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.VideoCall,
-                            contentDescription = null,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Record", fontSize = 14.sp)
-                    }
-                } else {
-                    Button(
-                        onClick = onDeleteClick,
-                        modifier = Modifier
-                            .height(40.dp)
-                            .semantics { contentDescription = "Delete task button" },
-                        shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFFEF5350),
-                            contentColor = Color.White
-                        )
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = null,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Delete", fontSize = 14.sp)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@androidx.annotation.OptIn(UnstableApi::class)
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun VideoPlaybackScreen(
-    fileName: String,
-    viewModel: TaskViewModel,
-    analytics: FirebaseAnalytics,
-    onBack: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    var videoUrl by remember { mutableStateOf<String?>(null) }
-    var playbackError by remember { mutableStateOf<String?>(null) }
-    var isLoading by remember { mutableStateOf(true) }
-    val coroutineScope = rememberCoroutineScope()
-    val exoPlayer = remember { ExoPlayer.Builder(context).build() }
-
-    LaunchedEffect(fileName) {
-        try {
-            val url = viewModel.getVideoDownloadUrl(fileName)
-            if (url != null) {
-                videoUrl = url
-                exoPlayer.setMediaItem(MediaItem.fromUri(url))
-                exoPlayer.prepare()
-                analytics.logEvent("video_playback_started") {
-                    param("file_name", fileName)
-                }
-            } else {
-                playbackError = "Failed to load video URL"
-                analytics.logEvent("video_playback_error") {
-                    param("file_name", fileName)
-                    param("error", "URL generation failed")
-                }
-            }
-        } catch (e: Exception) {
-            playbackError = "Error loading video: ${e.message}"
-            analytics.logEvent("video_playback_error") {
-                param("file_name", fileName)
-                param("error", e.message ?: "unknown")
-            }
-        } finally {
-            isLoading = false
-        }
-    }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Video Playback", color = Color.White) },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color(0xFF3F51B5)
-                ),
-                navigationIcon = {
-                    IconButton(
-                        onClick = onBack,
-                        modifier = Modifier.semantics { contentDescription = "Back button" }
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.ArrowBack,
-                            contentDescription = "Navigate back",
-                            tint = Color.White
-                        )
-                    }
-                }
-            )
-        }
-    ) { padding ->
-        Column(
-            modifier = modifier
-                .fillMaxSize()
-                .padding(padding)
-                .background(MaterialTheme.colorScheme.background)
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            if (isLoading) {
-                CircularProgressIndicator(
-                    color = Color(0xFF3F51B5),
-                    modifier = Modifier.semantics { contentDescription = "Loading video indicator" }
-                )
-            } else if (playbackError != null) {
-                Text(
-                    playbackError!!,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.semantics { contentDescription = "Playback error message: $playbackError" }
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(
-                    onClick = onBack,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .semantics { contentDescription = "Back button" },
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFFFF4081),
-                        contentColor = Color.White
-                    )
-                ) {
-                    Text("Back", fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                }
-            } else if (videoUrl != null) {
-                AndroidView(
-                    factory = { context ->
-                        PlayerView(context).apply {
-                            player = exoPlayer
-                            useController = true
-                            setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
-                        }
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(300.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .border(2.dp, Color(0xFF3F51B5), RoundedCornerShape(16.dp))
-                        .semantics { contentDescription = "Video player" }
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Button(
-                    onClick = {
-                        exoPlayer.playWhenReady = !exoPlayer.playWhenReady
-                        analytics.logEvent("video_playback_toggled") {
-                            param("file_name", fileName)
-                            param("playing", exoPlayer.playWhenReady.toString())
-                        }
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .semantics { contentDescription = if (exoPlayer.playWhenReady) "Pause video button" else "Play video button" },
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF3F51B5),
-                        contentColor = Color.White
-                    )
-                ) {
-                    Text(
-                        if (exoPlayer.playWhenReady) "Pause" else "Play",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Button(
-                    onClick = onBack,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .semantics { contentDescription = "Back button" },
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFFFF4081),
-                        contentColor = Color.White
-                    )
-                ) {
-                    Text("Back", fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                }
-            }
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            exoPlayer.release()
-        }
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -2537,12 +2356,12 @@ fun CompletionNoteScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     var completionNote by remember { mutableStateOf("") }
     var isUploading by remember { mutableStateOf(false) }
     var uploadError by remember { mutableStateOf<String?>(null) }
-    var uploadSuccess by remember { mutableStateOf<String?>(null) }
     val coroutineScope = rememberCoroutineScope()
-    val context = LocalContext.current
+    val errorMessage by viewModel.errorMessage.collectAsState()
 
     Scaffold(
         topBar = {
@@ -2574,133 +2393,253 @@ fun CompletionNoteScreen(
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Card(
+            OutlinedTextField(
+                value = completionNote,
+                onValueChange = { completionNote = it },
+                label = { Text("Completion Note") },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 8.dp),
-                shape = RoundedCornerShape(16.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    OutlinedTextField(
-                        value = completionNote,
-                        onValueChange = { completionNote = it },
-                        label = { Text("Completion Note (Optional)") },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(120.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .semantics { contentDescription = "Completion note input field" },
-                        enabled = !isUploading,
-                        colors = TextFieldDefaults.colors(
-                            focusedIndicatorColor = Color(0xFF3F51B5),
-                            focusedLabelColor = Color(0xFF3F51B5),
-                            unfocusedContainerColor = Color.Transparent
-                        )
-                    )
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    if (uploadError != null) {
-                        Text(
-                            uploadError!!,
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.semantics { contentDescription = "Upload error message: $uploadError" }
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                    }
-
-                    if (uploadSuccess != null) {
-                        Text(
-                            uploadSuccess!!,
-                            color = Color(0xFF4CAF50),
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.semantics { contentDescription = "Upload success message: $uploadSuccess" }
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                    }
-
-                    Button(
-                        onClick = {
-                            if (isUploading) return@Button
-                            isUploading = true
-                            uploadError = null
-                            uploadSuccess = null
-                            coroutineScope.launch {
-                                try {
-                                    val uploadResult = viewModel.uploadVideo(
-                                        videoPath = videoPath,
-                                        taskId = taskId,
-                                        userId = userId,
-                                        completionNote = completionNote
-                                    )
-                                    if (uploadResult != null) {
-                                        uploadSuccess = "Video uploaded successfully!"
-                                        analytics.logEvent("video_upload_success") {
-                                            param("task_id", taskId)
-                                            param("video_id", uploadResult)
-                                        }
-                                        delay(2000L) // Show success message briefly
-                                        onBack()
-                                    } else {
-                                        uploadError = "Failed to upload video."
-                                        analytics.logEvent("video_upload_error") {
-                                            param("task_id", taskId)
-                                            param("error", "unknown")
-                                        }
-                                    }
-                                } catch (e: Exception) {
-                                    uploadError = "Upload failed: ${e.message}"
-                                    analytics.logEvent("video_upload_error") {
-                                        param("task_id", taskId)
-                                        param("error", e.message ?: "unknown")
-                                    }
-                                } finally {
-                                    isUploading = false
-                                }
+                    .height(150.dp)
+                    .semantics { contentDescription = "Completion note input field" },
+                enabled = !isUploading,
+                colors = TextFieldDefaults.colors(
+                    focusedIndicatorColor = Color(0xFF3F51B5),
+                    focusedLabelColor = Color(0xFF3F51B5),
+                    unfocusedContainerColor = Color.Transparent
+                )
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            if (errorMessage != null || uploadError != null) {
+                Text(
+                    errorMessage ?: uploadError!!,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.semantics { contentDescription = "Error message: ${errorMessage ?: uploadError}" }
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+            Button(
+                onClick = {
+                    isUploading = true
+                    uploadError = null
+                    coroutineScope.launch {
+                        try {
+                            viewModel.uploadVideo(videoPath, taskId, userId, completionNote)
+                            analytics.logEvent("video_upload_initiated") {
+                                param("task_id", taskId)
+                                param("user_id", userId)
                             }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp)
-                            .semantics { contentDescription = "Upload video button" },
-                        shape = RoundedCornerShape(12.dp),
-                        enabled = !isUploading,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF3F51B5),
-                            contentColor = Color.White
-                        )
-                    ) {
-                        if (isUploading) {
-                            CircularProgressIndicator(color = Color.White)
-                        } else {
-                            Text("Upload Video", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            onBack()
+                        } catch (e: Exception) {
+                            uploadError = "Upload failed: ${e.message}"
+                            analytics.logEvent("video_upload_error") {
+                                param("task_id", taskId)
+                                param("error", e.message ?: "unknown")
+                            }
+                        } finally {
+                            isUploading = false
                         }
                     }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .semantics { contentDescription = "Submit video button" },
+                shape = RoundedCornerShape(12.dp),
+                enabled = !isUploading,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF3F51B5),
+                    contentColor = Color.White
+                )
+            ) {
+                if (isUploading) {
+                    CircularProgressIndicator(color = Color.White)
+                } else {
+                    Text("Submit Video", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
 
-                    Spacer(modifier = Modifier.height(8.dp))
 
-                    Button(
-                        onClick = {
-                            File(videoPath).delete() // Clean up local file
-                            onBack()
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp)
-                            .semantics { contentDescription = "Cancel button" },
-                        shape = RoundedCornerShape(12.dp),
-                        enabled = !isUploading,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFFEF5350),
-                            contentColor = Color.White
-                        )
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun VideoPlaybackScreen(
+    fileName: String,
+    viewModel: TaskViewModel,
+    analytics: FirebaseAnalytics,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var videoUrl by remember { mutableStateOf<String?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val coroutineScope = rememberCoroutineScope()
+    val exoPlayer = remember { ExoPlayer.Builder(context).build() }
+
+    LaunchedEffect(fileName) {
+        try {
+            videoUrl = viewModel.getVideoDownloadUrl(fileName)
+            videoUrl?.let {
+                exoPlayer.setMediaItem(MediaItem.fromUri(it))
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = true
+                analytics.logEvent("video_playback_started") {
+                    param("file_name", fileName)
+                }
+            } ?: run {
+                errorMessage = "Failed to load video URL"
+                analytics.logEvent("video_playback_error") {
+                    param("file_name", fileName)
+                    param("error", "URL null")
+                }
+            }
+        } catch (e: Exception) {
+            errorMessage = "Error loading video: ${e.message}"
+            analytics.logEvent("video_playback_error") {
+                param("file_name", fileName)
+                param("error", e.message ?: "unknown")
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            exoPlayer.release()
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Video Playback", color = Color.White) },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color(0xFF3F51B5)
+                ),
+                navigationIcon = {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.semantics { contentDescription = "Back button" }
                     ) {
-                        Text("Cancel", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        Icon(
+                            imageVector = Icons.Default.ArrowBack,
+                            contentDescription = "Navigate back",
+                            tint = Color.White
+                        )
                     }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(MaterialTheme.colorScheme.background),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            if (videoUrl != null) {
+                AndroidView(
+                    factory = {
+                        PlayerView(context).apply {
+                            player = exoPlayer
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.WRAP_CONTENT
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(300.dp)
+                        .semantics { contentDescription = "Video player" }
+                )
+            } else if (errorMessage != null) {
+                Text(
+                    errorMessage!!,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier
+                        .padding(16.dp)
+                        .semantics { contentDescription = "Error message: $errorMessage" }
+                )
+            } else {
+                CircularProgressIndicator(
+                    modifier = Modifier.semantics { contentDescription = "Loading video" }
+                )
+            }
+        }
+    }
+}
+
+
+@Composable
+fun TaskCard(
+    task: Task,
+    isAdmin: Boolean = false,
+    onClickListener: () -> Unit = {},
+    onDeleteClickListener: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .shadow(4.dp, RoundedCornerShape(12.dp))
+            .clickable { if (!isAdmin) onClickListener() },
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = Color.White
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .semantics { contentDescription = "Task details: ${task.title}" }
+            ) {
+                Text(
+                    task.title,
+                    style = MaterialTheme.typography.bodyLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF3F51B5)
+                    ),
+                    modifier = Modifier.semantics { contentDescription = "Task title: ${task.title}" }
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    task.description,
+                    style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF757575)),
+                    modifier = Modifier.semantics { contentDescription = "Task description: ${task.description}" }
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "Points: ${task.points}",
+                    style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF4CAF50)),
+                    modifier = Modifier.semantics { contentDescription = "Task points: ${task.points}" }
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "Duration: ${task.durationSeconds}s",
+                    style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF757575)),
+                    modifier = Modifier.semantics { contentDescription = "Task duration: ${task.durationSeconds} seconds" }
+                )
+            }
+            if (isAdmin) {
+                IconButton(
+                    onClick = onDeleteClickListener,
+                    modifier = Modifier.semantics { contentDescription = "Delete task button" }
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Delete task",
+                        tint = Color(0xFFEF5350)
+                    )
                 }
             }
         }

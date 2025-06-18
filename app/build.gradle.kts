@@ -1,3 +1,4 @@
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android") version "1.9.24"
@@ -23,10 +24,14 @@ android {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            buildConfigField("String", "B2_KEY_ID", "\"your_b2_key_id\"")
+            buildConfigField("String", "B2_APPLICATION_KEY", "\"your_b2_application_key\"")
         }
         debug {
             isMinifyEnabled = false
             isDebuggable = true
+            buildConfigField("String", "B2_KEY_ID", "\"your_b2_key_id\"")
+            buildConfigField("String", "B2_APPLICATION_KEY", "\"your_b2_application_key\"")
         }
     }
 
@@ -41,6 +46,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true // Added to enable BuildConfig fields
     }
 
     composeOptions {
@@ -66,9 +72,8 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 
-    // AWS SDK
-    implementation("com.amazonaws:aws-android-sdk-core:2.71.0")
-    implementation("com.amazonaws:aws-android-sdk-s3:2.71.0")
+    // OkHttp for B2 HTTP API
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // CameraX
     implementation("androidx.camera:camera-core:1.3.4")

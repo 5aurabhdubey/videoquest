@@ -39,3 +39,7 @@
 
 -keep class com.amazonaws.** { *; }
 -dontwarn com.amazonaws.**
+# OkHttp
+-keep class okhttp3.** { *; }
+-keep interface okhttp3.** { *; }
+-dontwarn okhttp3.**
